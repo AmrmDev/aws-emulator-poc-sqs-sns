@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
-	"errors"
 
 	"aws-emulator-poc-sqs-sns/config"
 	"aws-emulator-poc-sqs-sns/internal/messaging"
@@ -38,12 +38,11 @@ func main() {
 	log.Println("SQS CONSUMER STARTED")
 	log.Println("")
 
-
 	if err := consumer.Consume(ctx); err != nil {
 		if !errors.Is(err, context.Canceled) {
 			log.Fatalf("Consumer failed: %v", err)
 		}
-	}	
+	}
 
 	log.Println("SQS CONSUMER STOPPED")
 }

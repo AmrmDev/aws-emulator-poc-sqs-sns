@@ -38,11 +38,11 @@ func (c *Consumer) Consume(ctx context.Context) error {
 	for {
 		result, err := c.client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 			QueueUrl:            aws.String(c.queueURL),
-			MaxNumberOfMessages: 5,
-			WaitTimeSeconds:     10,
+			MaxNumberOfMessages: 10,
+			WaitTimeSeconds:     20,
 		})
 		if err != nil {
-			return fmt.Errorf("Receive SQS messages: %w", err)
+			return fmt.Errorf("receive SQS messages: %w", err)
 		}
 
 		for _, message := range result.Messages {
@@ -51,7 +51,7 @@ func (c *Consumer) Consume(ctx context.Context) error {
 				continue
 			}
 
-			_, err = c.client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
+			_, err := c.client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
 				QueueUrl:      aws.String(c.queueURL),
 				ReceiptHandle: message.ReceiptHandle,
 			})
@@ -59,35 +59,48 @@ func (c *Consumer) Consume(ctx context.Context) error {
 				fmt.Printf("Delete message failed: %v\n", err)
 				continue
 			}
+
+			fmt.Println("Message deleted successfully!")
+			fmt.Println("===================================")
 		}
 	}
 }
 
 func (c *Consumer) process(ctx context.Context, message types.Message) error {
-	if message.Body == nil {
+	if message.Body == nil || *message.Body == "" {
 		return fmt.Errorf("empty message body")
 	}
 
-	body := *message.Body
-
 	var envelope SNSEnvelope
 
-	if err := json.Unmarshal([]byte(body), &envelope); err == nil &&
-		envelope.Type == "Notification" {
-
-		fmt.Printf("SNS Event received: %s\n", envelope.MessageID)
-
-		body = envelope.Message
+	if err := json.Unmarshal([]byte(*message.Body), &envelope); err != nil {
+		return fmt.Errorf("invalid SNS envelope: %w", err)
 	}
+
+	if envelope.Type != "Notification" {
+		return fmt.Errorf("unexpected SNS message type: %s", envelope.Type)
+	}
+
+	if envelope.Message == "" {
+		return fmt.Errorf("empty SNS message payload")
+	}
+
+	fmt.Println("========== SQS CONSUMER ==========")
+	fmt.Println("SNS Notification received!")
+	fmt.Printf("SNS Message ID: %s\n", envelope.MessageID)
+	fmt.Printf("SNS Topic ARN: %s\n", envelope.TopicARN)
+	fmt.Printf("SNS Timestamp: %s\n", envelope.Timestamp)
 
 	var event map[string]any
 
-	if err := json.Unmarshal([]byte(body), &event); err != nil {
-		return fmt.Errorf("invalid event JSON: %w", err)
+	if err := json.Unmarshal([]byte(envelope.Message), &event); err != nil {
+		return fmt.Errorf("invalid payment event JSON: %w", err)
 	}
 
-	fmt.Printf("Processing event: %+v\n", event)
-	fmt.Println("===========================")
+	fmt.Println("-----------------------------------")
+	fmt.Println("Payment event processed:")
+	fmt.Printf("%+v\n", event)
+	fmt.Println("-----------------------------------")
 
 	return nil
 }

@@ -39,7 +39,12 @@ func (p *Publisher) Publish(ctx context.Context, event any) error {
 		return fmt.Errorf("publish SNS message: %w", err)
 	}
 
-	fmt.Printf("Message published! ID: %s\n", aws.ToString(result.MessageId))
+	fmt.Println("========== SNS PUBLISHER ==========")
+	fmt.Printf("Topic ARN: %s\n", p.topicARN)
+	fmt.Printf("Message ID: %s\n", aws.ToString(result.MessageId))
+	fmt.Printf("Payload: %s\n", string(payload))
+	fmt.Println("Message published successfully!")
+	fmt.Println("===================================")
 
 	return nil
 }
