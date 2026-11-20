@@ -1,126 +1,195 @@
-# AWS Emulator POC --- SNS → SQS → Go Consumer
+# AWS Emulator POC — SNS → SQS → Go Consumer
 
-> Demonstração local de mensageria assíncrona usando **Amazon SNS**,
-> **Amazon SQS**, **Go** e o **AWS Emulator** executado em Docker.
+> Mensageria assíncrona **100% local** com **Amazon SNS**, **Amazon SQS** e **Go**, usando o **AWS Emulator**, o emulador open source da AWS anunciado em 11/11/2026, rodando em Docker no Windows.
 
 ![Go](https://img.shields.io/badge/Go-1.24-00ADD8?logo=go&logoColor=white)
 ![AWS](https://img.shields.io/badge/AWS-SNS%20%7C%20SQS-FF9900?logo=amazonaws&logoColor=white)
-![Docker](https://img.shields.io/badge/Docker-Desktop-2496ED?logo=docker&logoColor=white)
+![AWS Emulator](https://img.shields.io/badge/AWS%20Emulator-local%20endpoint-232F3E?logo=amazonaws&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Desktop%20%2B%20WSL2-2496ED?logo=docker&logoColor=white)
 
-## Visão geral
+**Testado em:** 20/11/2026 · **Região:** `us-east-1` · **Endpoint:** `https://127.0.0.1:9297`
 
-Esta POC demonstra um fluxo simples de publicação e consumo de eventos:
+---
 
-1.  Uma aplicação Go publica um evento JSON em um tópico do **Amazon
-    SNS**.
-2.  O SNS entrega automaticamente a notificação para uma fila do
-    **Amazon SQS**, por meio de uma subscription.
-3.  Uma segunda aplicação Go recebe a mensagem usando **Long Polling**.
-4.  O consumer interpreta o envelope de notificação do SNS, extrai o
-    JSON original e simula o processamento do evento.
-5.  Após o processamento bem-sucedido, o consumer exclui a mensagem da
-    fila com `DeleteMessage`.
+## 🙏 Créditos e inspiração
 
-Os serviços AWS são executados localmente pelo AWS Emulator em um
-container Docker. A aplicação Go e a AWS CLI acessam o endpoint local
-por HTTPS.
+Esta POC nasceu da publicação do **Daniel Abib** (Senior Specialist Solutions Architect na AWS) no LinkedIn. Todos os créditos a ele pela divulgação e pelo post de lançamento do AWS Emulator.
 
-## Arquitetura
+- Publicação no LinkedIn: <https://lnkd.in/p/di6ZdG7U>
+- Post oficial de lançamento: [Test your applications against AWS locally with AWS Emulator](https://aws.amazon.com/blogs/aws/test-your-applications-against-aws-locally-with-aws-emulator/) (AWS News Blog, 11/11/2026)
+- Repositório do emulador: <https://github.com/aws/aws-emulator>
 
-``` mermaid
+Este repositório é um estudo independente e não é um material oficial da AWS.
+
+---
+
+## Sumário
+
+1. [O que é o AWS Emulator](#1-o-que-é-o-aws-emulator)
+2. [Visão geral da POC](#2-visão-geral-da-poc)
+3. [Arquitetura](#3-arquitetura)
+4. [Pré-requisitos](#4-pré-requisitos)
+5. [Preparação do Docker no Windows](#5-preparação-do-docker-no-windows)
+6. [Construindo a imagem do AWS Emulator](#6-construindo-a-imagem-do-aws-emulator)
+7. [Iniciando o AWS Emulator](#7-iniciando-o-aws-emulator)
+8. [Apontando AWS CLI e SDK para o emulador](#8-apontando-aws-cli-e-sdk-para-o-emulador)
+9. [Criando SNS, SQS, subscription e política](#9-criando-sns-sqs-subscription-e-política)
+10. [Implementação em Go](#10-implementação-em-go)
+11. [Executando a POC](#11-executando-a-poc)
+12. [Testes manuais com AWS CLI](#12-testes-manuais-com-aws-cli)
+13. [Comportamentos do emulador observados em SNS e SQS](#13-comportamentos-do-emulador-observados-em-sns-e-sqs)
+14. [Limitações do AWS Emulator que importam aqui](#14-limitações-do-aws-emulator-que-importam-aqui)
+15. [Troubleshooting](#15-troubleshooting)
+16. [Escopo e próximos passos](#16-escopo-e-próximos-passos)
+17. [Conclusão](#17-conclusão)
+18. [Referências](#18-referências)
+
+---
+
+## 1. O que é o AWS Emulator
+
+O **AWS Emulator** é um emulador local de serviços AWS, escrito em **Rust**, gratuito e de código aberto. Ele expõe um **endpoint HTTPS local** que responde às mesmas APIs usadas na nuvem. Por isso a **AWS CLI**, os **AWS SDKs** e agentes de código (Kiro, Claude Code etc.) conversam com ele sem alterar o código da aplicação.
+
+### Características que sustentam esta POC
+
+| Característica | Como aparece nesta POC |
+|---|---|
+| **Mesmas APIs da AWS.** É construído a partir dos modelos de API (Smithy) usados pelos SDKs, então requisições e erros têm o mesmo formato da AWS. | O código Go usa o SDK v2 normalmente, sem mocks e sem client customizado. |
+| **Endpoint HTTPS local**, por padrão em `127.0.0.1:9297`. | `AWS_ENDPOINT_URL=https://127.0.0.1:9297` redireciona CLI e SDK. |
+| **Credenciais, config e CA próprias**, geradas na inicialização e gravadas em `~/.aws/emulator/9297/`. | Volume Docker persiste essa pasta no Windows. |
+| **Chaves novas a cada start**, com Access Key ID iniciando em `EMULATOR`. Requisições assinadas com outras chaves são rejeitadas. | Impede o uso acidental de credenciais reais. |
+| **SigV4 obrigatório** (como na AWS). | O SDK Go assina normalmente. |
+| **Conta única `000000000000`**, sem comportamento entre contas ou regiões. | Todos os ARNs desta POC usam esse account ID. |
+| **Health endpoint** em `/__admin/health`. | Usado para confirmar que o emulador subiu. |
+| **Operação não implementada retorna HTTP 501**, então o teste falha imediatamente. | Ver [Troubleshooting](#15-troubleshooting). |
+| **Fidelity tests** publicados por serviço (k de n), verificados contra a AWS real. | Consulte as pontuações de SNS e SQS na documentação. |
+| **Telemetria anônima ligada por padrão**, desativável. | Iniciamos com `--telemetry off`. |
+| **No Windows e macOS roda em Docker**; não há imagem pronta publicada. | Construímos a imagem localmente (seção 6). |
+
+> O **modo embedded** (emulador dentro do processo de teste) existe apenas para o AWS SDK for Rust. Como esta POC é em Go, usamos o emulador como **processo/container separado**, via endpoint HTTPS.
+
+---
+
+## 2. Visão geral da POC
+
+1. Uma aplicação Go (**Publisher**) publica um evento JSON de pagamento em um tópico **SNS** emulado.
+2. O SNS entrega o evento a uma fila **SQS** emulada, via subscription com protocolo `sqs`.
+3. Uma segunda aplicação Go (**Consumer**) recebe a mensagem com **Long Polling** (`WaitTimeSeconds: 20`).
+4. O Consumer interpreta o **envelope de notificação do SNS**, extrai o campo `Message` e desserializa o evento de pagamento.
+5. Após processar com sucesso, o Consumer executa `DeleteMessage`.
+
+Tudo roda na máquina local: **nenhum recurso é criado em conta AWS real e nenhuma credencial real é usada**.
+
+---
+
+## 3. Arquitetura
+
+```mermaid
 flowchart LR
-    A[Go Publisher] -->|Publish JSON| B[Amazon SNS]
-    B -->|Subscription: SQS| C[Amazon SQS]
-    C -->|ReceiveMessage / Long Polling| D[Go Consumer]
-    D -->|Processa evento| E[DeleteMessage]
+    subgraph Host["Windows + Docker Desktop (WSL 2)"]
+        P[Go Publisher]
+        C[Go Consumer]
+        CLI[AWS CLI]
+        subgraph EMU["Container: AWS Emulator :9297 (HTTPS + SigV4)"]
+            T[SNS Topic<br/>poc-payment-events]
+            Q[SQS Queue<br/>poc-payment-processing]
+            T -->|Subscription: sqs| Q
+        end
+    end
+    P -->|sns:Publish| T
+    Q -->|sqs:ReceiveMessage<br/>Long Polling 20s| C
+    C -->|sqs:DeleteMessage| Q
+    CLI -.->|testes manuais| EMU
+```
+
+### Fluxo de uma mensagem
+
+```mermaid
+sequenceDiagram
+    participant P as Publisher (Go)
+    participant SNS as SNS (Emulator)
+    participant SQS as SQS (Emulator)
+    participant C as Consumer (Go)
+
+    C->>SQS: ReceiveMessage (WaitTimeSeconds=20)
+    Note over C,SQS: Long Polling aguardando
+    P->>SNS: Publish(JSON do pagamento)
+    SNS-->>P: MessageId
+    SNS->>SQS: Notification (envelope SNS) via subscription
+    SQS-->>C: Message.Body = envelope SNS
+    C->>C: Unmarshal envelope → Unmarshal campo "Message"
+    C->>C: Processa o evento
+    C->>SQS: DeleteMessage(ReceiptHandle)
 ```
 
 ### Recursos utilizados
 
-  ------------------------------------------------------------------------------------------------------------------------------
-  Recurso                 Nome                       Identificador
-  ----------------------- -------------------------- ---------------------------------------------------------------------------
-  Região                  `us-east-1`                ---
+| Recurso | Nome | Identificador |
+|---|---|---|
+| Região | `us-east-1` | — |
+| Endpoint local | `https://127.0.0.1:9297` | — |
+| SNS Topic | `poc-payment-events` | `arn:aws:sns:us-east-1:000000000000:poc-payment-events` |
+| SQS Queue | `poc-payment-processing` | `https://sqs.us-east-1.amazonaws.com/000000000000/poc-payment-processing` |
+| SQS Queue ARN | — | `arn:aws:sqs:us-east-1:000000000000:poc-payment-processing` |
+| Subscription | SNS → SQS | Protocolo `sqs` |
 
-  Endpoint local          `https://127.0.0.1:9297`   ---
+O account ID `000000000000` é a conta única do emulador, não uma conta AWS real.
 
-  SNS Topic               `poc-payment-events`       `arn:aws:sns:us-east-1:000000000000:poc-payment-events`
+---
 
-  SQS Queue               `poc-payment-processing`   `https://sqs.us-east-1.amazonaws.com/000000000000/poc-payment-processing`
+## 4. Pré-requisitos
 
-  Subscription            SNS → SQS                  Protocolo `sqs`
-  ------------------------------------------------------------------------------------------------------------------------------
+| Ferramenta | Observação |
+|---|---|
+| Windows 10/11 com **WSL 2** | Backend Linux do Docker Desktop |
+| **Docker Desktop** | Executa o AWS Emulator em container |
+| **AWS CLI v2** | Para criar recursos e inspecionar o fluxo |
+| **Go 1.24** + **AWS SDK for Go v2** | Publisher e Consumer |
+| **PowerShell** | Todos os comandos deste guia |
 
-O account ID `000000000000` é o identificador local apresentado pelo
-Emulator, não uma conta AWS real.
+Variáveis e comandos deste guia estão em PowerShell. No Linux/macOS a lógica é a mesma, mudando apenas a sintaxe de variáveis de ambiente (`export`).
 
-## Tecnologias
+---
 
--   Go 1.24
--   AWS SDK for Go v2
--   Amazon SNS
--   Amazon SQS
--   AWS Emulator
--   Docker Desktop
--   WSL 2
--   AWS CLI
--   Windows PowerShell
+## 5. Preparação do Docker no Windows
 
-## 1. Preparação do ambiente Docker
+### 5.1. Atualizar o WSL
 
-O ambiente foi configurado no Windows usando Docker Desktop com backend
-Linux baseado em WSL 2.
-
-### 1.1. Atualizar o WSL
-
-No PowerShell:
-
-``` powershell
+```powershell
 wsl --update
 wsl --shutdown
 ```
 
-O `wsl --shutdown` encerra as distribuições e reinicia o ambiente WSL na
-próxima inicialização.
+O `wsl --shutdown` encerra as distribuições. O WSL reinicia na próxima utilização.
 
-### 1.2. Verificar o Docker
+### 5.2. Verificar o Docker
 
-``` powershell
+```powershell
 docker info
 ```
 
-O comando deve apresentar informações do **Client** e do **Server**. Se
-aparecer um erro de conexão com `dockerDesktopLinuxEngine`, o Docker
-Engine ainda não está disponível. Abra o Docker Desktop e aguarde a
-inicialização antes de continuar.
+O comando deve exibir **Client** e **Server**. Se aparecer erro de conexão com `dockerDesktopLinuxEngine`, abra o Docker Desktop e aguarde a inicialização.
 
-Também é possível verificar o estado das distribuições WSL:
-
-``` powershell
+```powershell
 wsl --list --verbose
 ```
 
-Na configuração utilizada nesta POC, a distribuição `docker-desktop`
-aparece com versão 2 quando o Docker Desktop está inicializado.
+Com o Docker Desktop ativo, a distribuição `docker-desktop` aparece com versão `2`.
 
-## 2. Construção da imagem do AWS Emulator
+---
 
-Foi criada uma imagem Docker própria a partir da imagem mínima do Amazon
-Linux 2023. Durante o build, o pacote RPM do AWS Emulator é baixado e
-instalado.
+## 6. Construindo a imagem do AWS Emulator
 
-Crie uma pasta para o ambiente:
+No Windows (e no macOS), a AWS **não publica uma imagem pronta**. É preciso construir uma a partir de um Dockerfile curto, que instala o pacote RPM oficial sobre o Amazon Linux 2023.
 
-``` powershell
+```powershell
 New-Item -ItemType Directory -Force "$env:USERPROFILE\aws-emulator-poc"
 Set-Location "$env:USERPROFILE\aws-emulator-poc"
 ```
 
-Crie um arquivo chamado `Dockerfile` (sem extensão `.txt`).
+Crie o arquivo `Dockerfile` (sem extensão `.txt`):
 
-Exemplo de Dockerfile correspondente à imagem construída nesta POC:
-
-``` dockerfile
+```dockerfile
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal
 
 ADD https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest/aws-emulator-x86_64.rpm /tmp/aws-emulator.rpm
@@ -129,49 +198,31 @@ RUN rpm -i /tmp/aws-emulator.rpm \
     && rm /tmp/aws-emulator.rpm \
     && mkdir -p /home/emulator \
     && chown 1000 /home/emulator
+
+USER 1000
+ENTRYPOINT ["aws-emulator"]
 ```
 
-> **Observação:** o conteúdo acima reproduz a base, o pacote e as etapas
-> de instalação observadas nos logs do build. Caso o Dockerfile original
-> tenha instruções adicionais, mantenha-as. O arquivo precisa se chamar
-> exatamente `Dockerfile`, e não `Dockerfile.txt`.
+> **Sobre `USER` e `ENTRYPOINT`:** o comando `docker run ... aws-emulator -p 9297 --telemetry off` da seção 7 só funciona se o `ENTRYPOINT` for o binário `aws-emulator`, pois é ele que recebe `-p` e `--telemetry`. O `USER 1000` é coerente com o `chown 1000 /home/emulator`. Se o Dockerfile da documentação oficial tiver instruções adicionais, **prevalece o oficial**.
 
-Se o arquivo tiver sido criado como `Dockerfile.txt`, renomeie:
+O pacote RPM instala o comando `aws-emulator` em `/usr/bin/`. Para versões `arm64` ou para o pacote Debian, consulte a documentação oficial.
 
-``` powershell
-Rename-Item Dockerfile.txt Dockerfile
-```
-
-Construa a imagem:
-
-``` powershell
+```powershell
 docker build -t aws-emulator .
-```
-
-Confira se ela foi criada:
-
-``` powershell
 docker images
 ```
 
-Nos logs desta execução, a imagem `aws-emulator:latest` foi criada com
-sucesso. O tamanho exibido foi aproximadamente 2,03 GB de uso em disco e
-577 MB de conteúdo.
+Nos logs desta execução, `aws-emulator:latest` foi criada com sucesso (≈ 2,03 GB de uso em disco, 577 MB de conteúdo).
 
-## 3. Inicialização do AWS Emulator
+---
 
-O Emulator utiliza uma pasta persistente no perfil do usuário para
-armazenar arquivos de configuração, credenciais e certificados.
+## 7. Iniciando o AWS Emulator
 
-Crie o diretório:
+O emulador grava credenciais, `config` e certificado CA em `~/.aws/emulator/<porta>/`. Para que esses arquivos fiquem acessíveis no Windows (e sobrevivam ao `--rm`), montamos um volume:
 
-``` powershell
+```powershell
 New-Item -ItemType Directory -Force "$env:USERPROFILE\.aws\emulator"
-```
 
-Inicie o container:
-
-``` powershell
 $port = 9297
 
 docker run --rm --memory=2g --memory-swap=2g `
@@ -180,159 +231,217 @@ docker run --rm --memory=2g --memory-swap=2g `
   aws-emulator -p $port --telemetry off
 ```
 
-### O que cada opção faz
+| Opção | Finalidade |
+|---|---|
+| `--rm` | Remove o container ao encerrar |
+| `--memory=2g` / `--memory-swap=2g` | Limita memória e swap a 2 GB |
+| `-p 127.0.0.1:9297:9297` | Publica a porta **somente no loopback**, então só a própria máquina acessa o emulador |
+| `-v ...\.aws\emulator:/home/emulator/.aws/emulator` | Persiste credenciais, config e CA no Windows |
+| `aws-emulator -p 9297` | Inicia o emulador na porta 9297 |
+| `--telemetry off` | Desativa o envio de dados anônimos de uso e erro |
 
-  -----------------------------------------------------------------------
-  Opção                               Finalidade
-  ----------------------------------- -----------------------------------
-  `--rm`                              Remove o container quando ele é
-                                      encerrado
+Mantenha esse terminal aberto durante toda a POC. O emulador escreve o log em **JSON lines**.
 
-  `--memory=2g`                       Limita a memória do container a 2
-                                      GB
+### 7.1. Arquivos gerados
 
-  `--memory-swap=2g`                  Define o limite combinado de
-                                      memória e swap em 2 GB
+Com o emulador no ar, liste a pasta no Windows:
 
-  `-p 127.0.0.1:9297:9297`            Publica a porta local somente na
-                                      interface de loopback
+```powershell
+Get-ChildItem "$env:USERPROFILE\.aws\emulator\9297"
+```
 
-  `-v ...`                            Persiste os arquivos do Emulator no
-                                      Windows
+Devem existir, segundo o post de lançamento:
 
-  `-p 9297`                           Inicia o Emulator na porta 9297
+| Arquivo | Uso |
+|---|---|
+| `emulator_credentials` | Credenciais locais (Access Key ID começa com `EMULATOR`) |
+| `config` | Config do AWS CLI/SDK apontando para o emulador |
+| `ca.pem` | CA própria do emulador, necessária para confiar no HTTPS local |
 
-  `--telemetry off`                   Desabilita a telemetria
-  -----------------------------------------------------------------------
+> **Atenção:** o emulador **gera chaves novas a cada inicialização**. Se você reiniciar o container, reinicie também o Consumer e qualquer processo que tenha lido as credenciais anteriores.
 
-Mantenha esse terminal aberto enquanto estiver executando a POC.
+### 7.2. Verificar a inicialização
 
-### 3.1. Verificar a inicialização
+O log deve indicar:
 
-O log de inicialização deve indicar o endpoint:
-
-``` text
+```text
 endpoint_url: https://127.0.0.1:9297
 health_check_url: https://127.0.0.1:9297/__admin/health
 ```
 
-O health check pode ser validado no PowerShell:
-
-``` powershell
-curl.exe --cacert "$env:AWS_CA_BUNDLE" `
+```powershell
+curl.exe --cacert "$env:USERPROFILE\.aws\emulator\9297\ca.pem" `
   https://127.0.0.1:9297/__admin/health
 ```
 
 Resultado esperado:
 
-``` text
+```text
 ok
 ```
 
-O Emulator gera e utiliza sua própria CA. O caminho do certificado deve
-ser configurado conforme os arquivos gerados pelo Emulator. Nos testes
-desta máquina, `AWS_CA_BUNDLE` foi utilizado para apontar para o
-certificado CA correspondente.
+---
 
-## 4. Configuração da AWS CLI
+## 8. Apontando AWS CLI e SDK para o emulador
 
-Configure as variáveis de ambiente no PowerShell:
+O ponto central da proposta do AWS Emulator: **o código não muda**, só o ambiente. Crie um arquivo `env.ps1` na raiz do projeto:
 
-``` powershell
-$env:AWS_REGION = "us-east-1"
-$env:AWS_ENDPOINT_URL = "https://127.0.0.1:9297"
+```powershell
+# env.ps1 — aponta CLI e SDK para o AWS Emulator
+$emu = "$env:USERPROFILE\.aws\emulator\9297"
 
+# Endpoint e região
+$env:AWS_ENDPOINT_URL                  = "https://127.0.0.1:9297"
+$env:AWS_REGION                        = "us-east-1"
+$env:AWS_DEFAULT_REGION                = "us-east-1"
+
+# Credenciais, config e CA gerados pelo emulador
+$env:AWS_SHARED_CREDENTIALS_FILE       = "$emu\emulator_credentials"
+$env:AWS_CONFIG_FILE                   = "$emu\config"
+$env:AWS_CA_BUNDLE                     = "$emu\ca.pem"
+
+# Evita chamadas à AWS real / ao IMDS
+$env:AWS_EC2_METADATA_DISABLED         = "true"
+$env:AWS_DISABLE_HOST_PREFIX_INJECTION = "true"
+
+# Garante que nenhuma credencial real seja usada
+Remove-Item Env:AWS_ACCESS_KEY_ID, Env:AWS_SECRET_ACCESS_KEY, `
+            Env:AWS_SESSION_TOKEN, Env:AWS_PROFILE -ErrorAction SilentlyContinue
+
+# Variáveis da POC
 $env:SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:000000000000:poc-payment-events"
-
 $env:SQS_QUEUE_URL = "https://sqs.us-east-1.amazonaws.com/000000000000/poc-payment-processing"
 ```
 
-Para facilitar os comandos manuais, também defina:
+Carregue em **cada novo terminal** (use o ponto + espaço, *dot-sourcing*, para que as variáveis valham na sessão atual):
 
-``` powershell
-$endpoint = "https://127.0.0.1:9297"
-
-$topicArn = "arn:aws:sns:us-east-1:000000000000:poc-payment-events"
-
-$queueUrl = "https://sqs.us-east-1.amazonaws.com/000000000000/poc-payment-processing"
+```powershell
+. .\env.ps1
 ```
 
-As variáveis definidas com `$env:` ficam disponíveis nos processos
-iniciados a partir daquela sessão do PowerShell. Se abrir outro
-terminal, configure-as novamente.
+### Por que cada variável importa
 
-### 4.1. Validar a identidade local
+| Variável | Motivo |
+|---|---|
+| `AWS_ENDPOINT_URL` | Redireciona CLI e SDKs para o emulador. Com ela definida, **`--endpoint-url` deixa de ser necessário** nos comandos. |
+| `AWS_SHARED_CREDENTIALS_FILE` / `AWS_CONFIG_FILE` | Usam as credenciais `EMULATOR*` geradas na inicialização. Chaves de outra origem são rejeitadas. |
+| `AWS_CA_BUNDLE` | O endpoint HTTPS usa uma CA própria. Sem ela, ocorrem erros de certificado (`x509`). O AWS SDK for Go v2 respeita essa variável. |
+| `AWS_EC2_METADATA_DISABLED` | Impede o SDK de procurar credenciais no IMDS. |
+| `AWS_DISABLE_HOST_PREFIX_INJECTION` | Recomendada no post de lançamento para o cenário local. |
+| `Remove-Item Env:AWS_ACCESS_KEY_ID...` | Evita que credenciais reais da sessão atrapalhem (ou vazem para) a execução local. |
 
-``` powershell
-aws sts get-caller-identity `
-  --endpoint-url $endpoint `
-  --region us-east-1
+> No SDK for Java, por exemplo, é preciso configurar o *trust store* para o certificado do emulador. No Go, `AWS_CA_BUNDLE` resolve.
+
+### 8.1. Validar a identidade local
+
+```powershell
+aws sts get-caller-identity
 ```
 
-O Emulator utiliza credenciais locais. A identidade retornada não
-representa uma identidade IAM de uma conta AWS real.
+Deve retornar a conta `000000000000`. Essa identidade **não** representa uma identidade IAM real.
 
-## 5. Criação e validação dos recursos SNS e SQS
+---
 
-Os recursos desta POC são:
+## 9. Criando SNS, SQS, subscription e política
 
--   Um tópico SNS: `poc-payment-events`.
--   Uma fila SQS: `poc-payment-processing`.
--   Uma subscription ligando o tópico SNS à fila SQS.
+Com o `env.ps1` carregado, nenhum comando precisa de `--endpoint-url` ou `--region`.
 
-Os ARNs e a URL apresentados abaixo são os identificadores utilizados
-nesta execução.
+### 9.1. Criar a fila SQS
 
-### 5.1. Conferir o tópico SNS
-
-``` powershell
-aws sns list-topics `
-  --region us-east-1 `
-  --endpoint-url $endpoint
+```powershell
+aws sqs create-queue --queue-name poc-payment-processing
 ```
 
-Resultado observado:
-
-``` json
+```json
 {
-  "Topics": [
+  "QueueUrl": "https://sqs.us-east-1.amazonaws.com/000000000000/poc-payment-processing"
+}
+```
+
+### 9.2. Criar o tópico SNS
+
+```powershell
+aws sns create-topic --name poc-payment-events
+```
+
+```json
+{
+  "TopicArn": "arn:aws:sns:us-east-1:000000000000:poc-payment-events"
+}
+```
+
+### 9.3. Criar a subscription SNS → SQS
+
+```powershell
+aws sns subscribe `
+  --topic-arn $env:SNS_TOPIC_ARN `
+  --protocol sqs `
+  --notification-endpoint arn:aws:sqs:us-east-1:000000000000:poc-payment-processing
+```
+
+### 9.4. Política da fila: autorizar o SNS a enviar mensagens
+
+Criar a subscription **não basta**. A fila precisa permitir `sqs:SendMessage` para o serviço SNS, restrito ao tópico de origem. Sem isso, o emulador registra este aviso e **retém a notificação**:
+
+```text
+the subscribed queue's policy does not allow this service to send it a message,
+so the notification is withheld
+```
+
+Crie `sqs-queue-policy.json`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
     {
-      "TopicArn": "arn:aws:sns:us-east-1:000000000000:poc-payment-events"
+      "Sid": "AllowSNSPublishToQueue",
+      "Effect": "Allow",
+      "Principal": { "Service": "sns.amazonaws.com" },
+      "Action": "sqs:SendMessage",
+      "Resource": "arn:aws:sqs:us-east-1:000000000000:poc-payment-processing",
+      "Condition": {
+        "ArnEquals": {
+          "aws:SourceArn": "arn:aws:sns:us-east-1:000000000000:poc-payment-events"
+        }
+      }
     }
   ]
 }
 ```
 
-### 5.2. Conferir a fila SQS
+O atributo `Policy` do SQS é uma **string JSON dentro de outro JSON**. O script abaixo monta o arquivo corretamente, sem BOM:
 
-``` powershell
-aws sqs list-queues `
-  --region us-east-1 `
-  --endpoint-url $endpoint
+```powershell
+$attributes = @{
+    Policy = (Get-Content .\sqs-queue-policy.json -Raw)
+} | ConvertTo-Json -Compress
+
+[System.IO.File]::WriteAllText(
+    "$PWD\queue-attributes.json",
+    $attributes,
+    [System.Text.UTF8Encoding]::new($false)
+)
+
+aws sqs set-queue-attributes `
+  --queue-url $env:SQS_QUEUE_URL `
+  --attributes file://queue-attributes.json
 ```
 
-Resultado observado:
+> **Importante:** o AWS Emulator **não avalia políticas IAM e resource-based como a AWS faz** (ver [seção 14](#14-limitações-do-aws-emulator-que-importam-aqui)). Aplique esta política mesmo assim: ela é **obrigatória na AWS real** e mantém o seu código/infra pronto para produção. Mas não trate o comportamento do emulador como validação de segurança.
 
-``` json
-{
-  "QueueUrls": [
-    "https://sqs.us-east-1.amazonaws.com/000000000000/poc-payment-processing"
-  ]
-}
+### 9.5. Conferir os recursos
+
+```powershell
+aws sns list-topics
+aws sqs list-queues
+aws sns list-subscriptions-by-topic --topic-arn $env:SNS_TOPIC_ARN
+aws sqs get-queue-attributes --queue-url $env:SQS_QUEUE_URL --attribute-names Policy
 ```
 
-### 5.3. Conferir a subscription
+Resultado observado da subscription:
 
-``` powershell
-aws sns list-subscriptions-by-topic `
-  --topic-arn $topicArn `
-  --region us-east-1 `
-  --endpoint-url $endpoint
-```
-
-Resultado observado:
-
-``` json
+```json
 {
   "Subscriptions": [
     {
@@ -346,108 +455,54 @@ Resultado observado:
 }
 ```
 
-Isso confirma a existência da subscription com protocolo `sqs` e o
-tópico e fila esperados.
+---
 
-### 5.4. Permissão da fila para receber notificações do SNS
-
-A fila precisa permitir que o serviço SNS execute `sqs:SendMessage`.
-Durante a configuração, o Emulator registrou este aviso:
-
-``` text
-the subscribed queue's policy does not allow this service to send it a message,
-so the notification is withheld
-```
-
-Esse aviso indica que a subscription existia, mas a política da fila não
-permitia a entrega.
-
-Uma política de fila para esse cenário pode permitir `sqs:SendMessage`
-somente quando a origem for o tópico esperado:
-
-Crie `sqs-queue-policy.json`:
-
-``` json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "AllowSNSPublishToQueue",
-      "Effect": "Allow",
-      "Principal": {
-        "Service": "sns.amazonaws.com"
-      },
-      "Action": "sqs:SendMessage",
-      "Resource": "arn:aws:sqs:us-east-1:000000000000:poc-payment-processing",
-      "Condition": {
-        "ArnEquals": {
-          "aws:SourceArn": "arn:aws:sns:us-east-1:000000000000:poc-payment-events"
-        }
-      }
-    }
-  ]
-}
-```
-
-Aplique a política à fila:
-
-``` powershell
-$attributes = @{
-    Policy = (Get-Content .\sqs-queue-policy.json -Raw)
-} | ConvertTo-Json -Compress
-
-[System.IO.File]::WriteAllText(
-    "$PWD\queue-attributes.json",
-    $attributes,
-    [System.Text.UTF8Encoding]::new($false)
-)
-
-aws sqs set-queue-attributes `
-  --queue-url $queueUrl `
-  --attributes file://queue-attributes.json `
-  --region us-east-1 `
-  --endpoint-url $endpoint
-```
-
-> A política acima documenta a permissão necessária para a entrega SNS →
-> SQS. Valide o comportamento no Emulator utilizado; a sintaxe e o
-> suporte a políticas podem variar entre implementações locais.
-
-## 6. Implementação Go
-
-A aplicação utiliza o AWS SDK for Go v2 para se comunicar com SNS e SQS.
+## 10. Implementação em Go
 
 ### Estrutura do projeto
 
-``` text
+```text
 aws-emulator-poc-sqs-sns/
 ├── cmd/
-│   ├── publisher/
-│   │   └── main.go
-│   └── consumer/
-│       └── main.go
+│   ├── publisher/main.go
+│   └── consumer/main.go
 ├── config/
 │   └── config.go
 ├── internal/
 │   └── messaging/
 │       ├── sns.go
 │       └── sqs.go
+├── env.ps1
+├── sqs-queue-policy.json
 ├── go.mod
 └── README.md
 ```
 
-### Publisher
+### 10.1. Nenhuma configuração específica do emulador no código
 
-O Publisher:
+O AWS SDK for Go v2 lê `AWS_ENDPOINT_URL`, `AWS_CA_BUNDLE`, `AWS_SHARED_CREDENTIALS_FILE` e `AWS_CONFIG_FILE` pela cadeia padrão. O mesmo binário funciona no emulador e na AWS real, mudando só o ambiente:
 
-1.  Cria um evento de pagamento.
-2.  Serializa o evento em JSON.
-3.  Publica o payload no tópico SNS.
-4.  Exibe o `MessageId` retornado pelo serviço.
+```go
+// Trecho ilustrativo e simplificado
+cfg, err := config.LoadDefaultConfig(ctx)
+if err != nil {
+    log.Fatalf("load aws config: %v", err)
+}
 
-Exemplo do evento publicado:
+snsClient := sns.NewFromConfig(cfg)
+sqsClient := sqs.NewFromConfig(cfg)
+```
 
-``` json
+### 10.2. Publisher
+
+1. Cria o evento de pagamento.
+2. Serializa em JSON.
+3. Chama `sns:Publish` no tópico `SNS_TOPIC_ARN`.
+4. Exibe o `MessageId` retornado.
+
+Evento publicado:
+
+```json
 {
   "paymentId": "pay-go-001",
   "amount": 150.5,
@@ -458,31 +513,55 @@ Exemplo do evento publicado:
 }
 ```
 
-O campo `createdAt` é gerado em UTC durante a execução; o horário e os
-milissegundos variam.
+`createdAt` é gerado em UTC na execução; horário e milissegundos variam.
 
-### Consumer
+### 10.3. Consumer
 
-O Consumer executa continuamente o seguinte fluxo:
+Fluxo contínuo:
 
-1.  Chama `ReceiveMessage` com `WaitTimeSeconds: 20`.
-2.  Recebe mensagens da fila.
-3.  Desserializa o corpo recebido como um envelope SNS.
-4.  Extrai o conteúdo original do campo `Message`.
-5.  Desserializa o evento de pagamento.
-6.  Simula o processamento imprimindo os dados.
-7.  Executa `DeleteMessage` após o processamento bem-sucedido.
+1. `ReceiveMessage` com `WaitTimeSeconds: 20` (Long Polling).
+2. Desserializa `Body` como **envelope SNS**.
+3. Desserializa o campo `Message` como evento de pagamento.
+4. Processa (aqui, simulado com log).
+5. `DeleteMessage` **somente após sucesso**.
 
-O Long Polling reduz chamadas vazias ao aguardar mensagens por até 20
-segundos em cada requisição de recebimento.
+```go
+// Trecho ilustrativo e simplificado
+type snsEnvelope struct {
+    Type      string `json:"Type"`
+    MessageID string `json:"MessageId"`
+    TopicArn  string `json:"TopicArn"`
+    Message   string `json:"Message"`
+    Timestamp string `json:"Timestamp"`
+}
 
-### SNS Notification Envelope
+out, err := sqsClient.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
+    QueueUrl:            aws.String(queueURL),
+    MaxNumberOfMessages: 5,
+    WaitTimeSeconds:     20,
+})
 
-Quando o SNS entrega uma notificação à fila, o corpo recebido pelo SQS
-não é apenas o JSON do pagamento. Por padrão, ele é encapsulado em uma
-estrutura de notificação semelhante a esta:
+for _, m := range out.Messages {
+    var env snsEnvelope
+    if err := json.Unmarshal([]byte(*m.Body), &env); err != nil { /* log e continue */ }
 
-``` json
+    var payment map[string]any
+    if err := json.Unmarshal([]byte(env.Message), &payment); err != nil { /* log e continue */ }
+
+    // ... processa o evento ...
+
+    _, err = sqsClient.DeleteMessage(ctx, &sqs.DeleteMessageInput{
+        QueueUrl:      aws.String(queueURL),
+        ReceiptHandle: m.ReceiptHandle,
+    })
+}
+```
+
+### 10.4. Envelope de notificação SNS
+
+O SQS **não** recebe só o JSON do pagamento. Por padrão, o SNS entrega um envelope:
+
+```json
 {
   "Type": "Notification",
   "MessageId": "84f8ece1-745a-472c-8f9d-4431e9e6cf0a",
@@ -492,77 +571,47 @@ estrutura de notificação semelhante a esta:
 }
 ```
 
-O campo `Message` contém o JSON original publicado pelo Publisher. Por
-isso, o Consumer primeiro interpreta o envelope SNS e depois
-desserializa o conteúdo de `Message`.
+O emulador reproduz esse comportamento, e é por isso que o Consumer faz **dois `Unmarshal`**: primeiro o envelope, depois o conteúdo de `Message`.
 
-### Exclusão da mensagem
+### 10.5. Visibility Timeout e `DeleteMessage`
 
-O SQS não remove uma mensagem automaticamente quando ela é recebida. O
-recebimento a torna temporariamente invisível durante o Visibility
-Timeout.
+- Receber uma mensagem **não a remove**: ela fica invisível durante o *Visibility Timeout*.
+- O `ReceiptHandle` é único **por recebimento**.
+- Se o processamento falhar e o Consumer **não** executar `DeleteMessage`, a mensagem reaparece após o Visibility Timeout.
 
-Depois de processar a mensagem com sucesso, o Consumer chama:
+---
 
-``` go
-c.client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
-    QueueUrl:      aws.String(c.queueURL),
-    ReceiptHandle: message.ReceiptHandle,
-})
-```
+## 11. Executando a POC
 
-O `ReceiptHandle` é obtido no recebimento daquela mensagem e é utilizado
-para solicitar sua exclusão.
+### Checklist
 
-Se o processamento falhar, o Consumer não executa `DeleteMessage`. A
-mensagem poderá voltar a ficar disponível após o Visibility Timeout.
+- [ ] Docker Desktop ativo
+- [ ] Container do AWS Emulator em execução (terminal aberto)
+- [ ] `/__admin/health` retorna `ok`
+- [ ] `. .\env.ps1` carregado **neste** terminal
+- [ ] Tópico, fila, subscription e política criados (seção 9)
 
-## 7. Executando a POC
+### Terminal 1: Consumer
 
-Antes de executar, confirme:
-
--   Docker Desktop está ativo.
--   O container do AWS Emulator está em execução.
--   O health check retorna `ok`.
--   O tópico SNS existe.
--   A fila SQS existe.
--   A subscription SNS → SQS existe.
--   A fila permite que o SNS envie mensagens.
--   As variáveis de ambiente estão configuradas no terminal.
-
-### Terminal 1 --- iniciar o Consumer
-
-Na raiz do projeto Go:
-
-``` bash
+```bash
+. .\env.ps1
 go run ./cmd/consumer
 ```
 
-Saída inicial esperada:
-
-``` text
+```text
 2026/11/20 10:17:44 SQS CONSUMER STARTED
 ```
 
-O processo permanece aguardando mensagens.
+### Terminal 2: Publisher
 
-### Terminal 2 --- executar o Publisher
-
-Na raiz do projeto Go:
-
-``` bash
+```bash
+. .\env.ps1
 go run ./cmd/publisher
 ```
 
-O Publisher publica o evento no SNS e exibe o identificador retornado.
+### Log real da execução validada
 
-O Consumer deverá receber a notificação, extrair o evento e processá-lo.
-
-### Exemplo de log real da aplicação
-
-A execução validada nesta POC apresentou:
-
-``` text
+```text
 2026/11/20 10:17:44 SQS CONSUMER STARTED
 2026/11/20 10:17:44
 
@@ -579,90 +628,63 @@ Message deleted successfully!
 ===================================
 ```
 
-Esse log demonstra a entrega da notificação SNS, a extração e o
-processamento do evento e a exclusão da mensagem no SQS.
+Esse log comprova, **contra o AWS Emulator**: entrega SNS → SQS, extração do envelope, processamento e exclusão da mensagem.
 
-## 8. Testes manuais usando AWS CLI
+---
 
-Além da aplicação Go, o fluxo também foi explorado diretamente pela AWS
-CLI.
+## 12. Testes manuais com AWS CLI
 
-Todos os comandos abaixo utilizam o endpoint local.
+Com o `env.ps1` carregado, os comandos usam o emulador automaticamente.
 
-### 8.1. Publicar uma mensagem no SNS
+### 12.1. Publicar no SNS
 
-``` powershell
-aws sns publish `
-  --topic-arn $topicArn `
-  --message "Payment event from SNS!" `
-  --region us-east-1 `
-  --endpoint-url $endpoint
+```powershell
+aws sns publish --topic-arn $env:SNS_TOPIC_ARN --message "Payment event from SNS!"
 ```
 
-Resposta observada:
-
-``` json
-{
-  "MessageId": "4ff477ee-f9b9-415e-8fe6-53ab1a754c97"
-}
+```json
+{ "MessageId": "4ff477ee-f9b9-415e-8fe6-53ab1a754c97" }
 ```
 
-### 8.2. Receber mensagens no SQS
+### 12.2. Receber no SQS
 
-``` powershell
-aws sqs receive-message `
-  --queue-url $queueUrl `
-  --max-number-of-messages 5 `
-  --region us-east-1 `
-  --endpoint-url $endpoint
+```powershell
+aws sqs receive-message --queue-url $env:SQS_QUEUE_URL --max-number-of-messages 5
 ```
 
-A inspeção retornou dois tipos de mensagem durante os testes:
+Durante os testes a fila retornou dois tipos de mensagem:
 
--   Uma mensagem de teste simples: `Hello from AWS Emulator!`.
--   Uma notificação SNS contendo o envelope `Type`, `MessageId`,
-    `TopicArn`, `Message` e `Timestamp`.
+- Uma mensagem simples enviada diretamente: `Hello from AWS Emulator!`.
+- Uma notificação SNS com o envelope (`Type`, `MessageId`, `TopicArn`, `Message`, `Timestamp`).
 
-Isso permitiu observar diretamente como o SNS encapsula a mensagem antes
-de entregá-la ao SQS.
+Essa inspeção mostra exatamente como o SNS encapsula a mensagem antes de entregá-la ao SQS.
 
-### 8.3. Excluir uma mensagem
+### 12.3. Excluir uma mensagem
 
-Para excluir uma mensagem manualmente, utilize o `ReceiptHandle`
-retornado pela chamada de `receive-message`:
-
-``` powershell
+```powershell
 aws sqs delete-message `
-  --queue-url $queueUrl `
-  --receipt-handle "<RECEIPT_HANDLE_RETORNADO_PELO_RECEIVE>" `
-  --region us-east-1 `
-  --endpoint-url $endpoint
+  --queue-url $env:SQS_QUEUE_URL `
+  --receipt-handle "<RECEIPT_HANDLE_RETORNADO_PELO_RECEIVE>"
 ```
 
-O `ReceiptHandle` não é um valor fixo: use o valor exato retornado para
-aquela entrega. Um valor fictício, um handle antigo ou um handle copiado
-incorretamente pode resultar em `ReceiptHandleIsInvalid`.
+Use o `ReceiptHandle` exato retornado pelo `receive-message` daquela entrega. Placeholder, handle antigo ou copiado errado resultam em `ReceiptHandleIsInvalid`.
 
-### 8.4. Consultar a quantidade de mensagens
+### 12.4. Consultar quantidade de mensagens
 
-``` powershell
+```powershell
 aws sqs get-queue-attributes `
-  --queue-url $queueUrl `
-  --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible `
-  --region us-east-1 `
-  --endpoint-url $endpoint
+  --queue-url $env:SQS_QUEUE_URL `
+  --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible
 ```
 
-Os atributos permitem observar:
+| Atributo | Significado |
+|---|---|
+| `ApproximateNumberOfMessages` | Mensagens aproximadamente disponíveis para recebimento |
+| `ApproximateNumberOfMessagesNotVisible` | Mensagens recebidas e ainda dentro do Visibility Timeout |
 
--   `ApproximateNumberOfMessages`: mensagens aproximadamente disponíveis
-    para recebimento.
--   `ApproximateNumberOfMessagesNotVisible`: mensagens temporariamente
-    invisíveis, por exemplo, após serem recebidas por um consumer.
+Após consumo e exclusão:
 
-Após o consumo e a exclusão, os valores observados foram:
-
-``` json
+```json
 {
   "Attributes": {
     "ApproximateNumberOfMessagesNotVisible": "0",
@@ -671,141 +693,119 @@ Após o consumo e a exclusão, os valores observados foram:
 }
 ```
 
-### 8.5. Limpar a fila durante os testes
+### 12.5. Limpar a fila
 
-Para descartar mensagens de testes anteriores:
-
-``` powershell
-aws sqs purge-queue `
-  --queue-url $queueUrl `
-  --region us-east-1 `
-  --endpoint-url $endpoint
+```powershell
+aws sqs purge-queue --queue-url $env:SQS_QUEUE_URL
 ```
 
-A operação de purge remove as mensagens da fila e não deve ser usada
-enquanto mensagens importantes precisarem ser preservadas.
+Remove **todas** as mensagens da fila. Útil para voltar a um estado conhecido entre testes.
 
-## 9. Problemas encontrados e aprendizados
+---
 
-### Docker Engine indisponível
+## 13. Comportamentos do emulador observados em SNS e SQS
 
-**Sintoma:** `docker info` apresentava erro de conexão com
-`dockerDesktopLinuxEngine`.
+| Observação | Detalhe |
+|---|---|
+| **Envelope SNS reproduzido** | O corpo no SQS vem encapsulado (`Type: Notification`), como na AWS. |
+| **Aviso de política da fila** | Sem `sqs:SendMessage` para o tópico, o emulador registra um aviso e **retém** a notificação. |
+| **Visibility Timeout / ReceiptHandle** | `ReceiptHandleIsInvalid` ocorre com handle inválido ou desatualizado. |
+| **Long Polling** | `WaitTimeSeconds: 20` funcionou no Consumer sem ajustes. |
+| **Purge** | `purge-queue` limpou mensagens de testes anteriores. |
+| **Contagem de mensagens** | `ApproximateNumber*` refletiu consumo e exclusão. |
 
-**Investigação:** foram verificados os serviços do Windows, o estado do
-WSL e a inicialização do Docker Desktop.
+> Estas são observações **desta execução**, em um produto recém-lançado. A fidelidade varia por serviço e funcionalidade, então consulte as pontuações de SNS e SQS na documentação do AWS Emulator.
 
-**Resolução:** atualizar o WSL, executar `wsl --shutdown` e aguardar o
-Docker Desktop inicializar corretamente.
+---
 
-### Dockerfile não encontrado
+## 14. Limitações do AWS Emulator que importam aqui
 
-**Sintoma:**
+Segundo o post de lançamento:
 
-``` text
-failed to read dockerfile: open Dockerfile: no such file or directory
-```
+| Limitação | Impacto nesta POC |
+|---|---|
+| **Não avalia políticas IAM e resource-based como a AWS** | Uma requisição que a AWS negaria pode funcionar no emulador. **Não use o emulador para validar segurança.** Teste a política da fila (seção 9.4) na AWS real antes de produção. |
+| **Conta única, sem comportamento entre contas ou regiões** | Não é possível testar, por exemplo, SNS e SQS em contas diferentes. |
+| **Fidelidade varia por serviço/feature** | Comportamentos avançados de SNS/SQS podem diferir da AWS. |
+| **Operação não implementada → HTTP 501** | O teste falha imediatamente. Se isso ocorrer, abra uma issue no repositório. |
+| **Chaves novas a cada inicialização** | Reinicie processos que mantêm credenciais carregadas. |
+| **Produto recém-lançado (GA em 11/11/2026)** | Espere evolução rápida; o score de fidelidade pode oscilar conforme novos testes são adicionados. |
 
-**Causa:** o arquivo havia sido criado como `Dockerfile.txt`.
+Se notar diferença entre o emulador e a AWS, a recomendação do post é abrir uma issue em <https://github.com/aws/aws-emulator>.
 
-**Resolução:**
+---
 
-``` powershell
-Rename-Item Dockerfile.txt Dockerfile
-```
+## 15. Troubleshooting
 
-Depois disso, o build foi concluído.
+| Sintoma | Causa provável | Solução |
+|---|---|---|
+| `docker info` mostra erro de `dockerDesktopLinuxEngine` | Docker Engine indisponível | `wsl --update`, `wsl --shutdown`, reabrir o Docker Desktop e aguardar |
+| `failed to read dockerfile: open Dockerfile: no such file or directory` | Arquivo criado como `Dockerfile.txt` | `Rename-Item Dockerfile.txt Dockerfile` |
+| `docker run` falha ao interpretar `-p` ou `--telemetry` | Imagem sem `ENTRYPOINT ["aws-emulator"]` | Ajustar o Dockerfile (seção 6) e reconstruir |
+| Erro de certificado (`x509: certificate signed by unknown authority`) | CLI/SDK não confia na CA do emulador | Definir `AWS_CA_BUNDLE` para `...\9297\ca.pem` |
+| Erro de assinatura ou credencial inválida | Usando chaves que não são `EMULATOR*`, ou emulador reiniciado | Carregar `env.ps1`, remover `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` e reiniciar o processo |
+| Conexão recusada em `127.0.0.1:9297` | Container parado ou porta diferente | Conferir o terminal do emulador e o `/__admin/health` |
+| Aviso de *queue policy ... notification is withheld* | Fila sem permissão para o SNS | Aplicar a política da seção 9.4 |
+| Mensagem publicada mas Consumer não recebe | Subscription ou política ausente | Conferir seção 9.5 |
+| HTTP **501 Not Implemented** | Operação ainda não implementada no emulador | Verificar a documentação e, se for o caso, abrir issue |
+| `ReceiptHandleIsInvalid` | Placeholder, handle antigo ou copiado errado | Usar o handle do `receive-message` correspondente |
+| Fila ainda mostra 1 mensagem após consumir | Mensagem de teste avulsa (`Hello from AWS Emulator!`) | `purge-queue` para voltar a um estado conhecido |
+| Variáveis sumiram em outro terminal | Variáveis `$env:` valem só na sessão | Rodar `. .\env.ps1` no novo terminal |
 
-### Política da fila bloqueando a entrega SNS → SQS
+---
 
-**Sintoma:** o Emulator registrou que a política da fila não permitia
-que o SNS enviasse mensagens.
+## 16. Escopo e próximos passos
 
-**Aprendizado:** criar uma subscription não garante, por si só, que a
-fila autorize a publicação do SNS. A permissão `sqs:SendMessage` precisa
-estar disponível para o tópico de origem.
+### Implementado
 
-### `ReceiptHandleIsInvalid`
+- [x] AWS Emulator em Docker (imagem construída localmente)
+- [x] Endpoint HTTPS local com CA, credenciais e config do emulador
+- [x] Tópico SNS, fila SQS e subscription `sqs`
+- [x] Política da fila autorizando o SNS
+- [x] Publisher em Go (SNS Publish)
+- [x] Consumer em Go com Long Polling
+- [x] Tratamento do envelope SNS e extração do evento
+- [x] `DeleteMessage` após sucesso
+- [x] Testes manuais com AWS CLI
 
-**Sintoma:** o comando `delete-message` retornou:
+### Fora do escopo
 
-``` text
-ReceiptHandleIsInvalid
-```
+- Banco de dados ou persistência de pagamentos
+- Idempotência
+- Dead Letter Queue (DLQ) e estratégia de retry customizada
+- Regras de negócio reais de pagamentos
+- Observabilidade e infraestrutura de produção
 
-**Causa no teste:** primeiro foi utilizado um texto de exemplo no lugar
-do ReceiptHandle real. Depois, foi utilizado o handle retornado pelo
-recebimento.
+### Ideias para evoluir (ainda não testadas)
 
-**Aprendizado:** o `ReceiptHandle` deve ser copiado da resposta de
-recebimento correspondente. Não se deve reutilizar um placeholder ou
-presumir que um handle antigo continua válido.
+- Testar `RawMessageDelivery` na subscription, eliminando o envelope SNS.
+- Adicionar DLQ com `RedrivePolicy` e `maxReceiveCount`, e conferir como o emulador se comporta.
+- Testar filtros de subscription (`FilterPolicy`) com `MessageAttributes`.
+- Usar filas FIFO (`.fifo`) e tópicos FIFO.
+- Subir o emulador em pipelines de CI usando o `/__admin/health` como *wait-for-ready*.
+- Escrever testes de integração em Go que sobem o emulador e validam o fluxo ponta a ponta.
 
-### Mensagem de teste adicional na fila
+---
 
-Durante a inspeção manual, havia uma mensagem simples
-(`Hello from AWS Emulator!`) além da notificação SNS. Isso explica por
-que a fila ainda apresentava uma mensagem após a exclusão da
-notificação. A fila foi posteriormente limpa com `purge-queue` para
-deixar os testes seguintes em estado conhecido.
+## 17. Conclusão
 
-## 10. Escopo da POC
+O AWS Emulator permite rodar, **na própria máquina**, o padrão **publish/subscribe** (SNS) com processamento assíncrono (SQS) usando as **mesmas APIs, CLI e SDK** que serão usados na AWS real. O Publisher não conhece o Consumer: ele publica no tópico, a subscription entrega à fila, e o Consumer busca, interpreta o envelope, processa e confirma com `DeleteMessage`.
 
-### O que foi implementado
+O código Go permanece igual. O que muda é o ambiente (`AWS_ENDPOINT_URL`, CA e credenciais do emulador). O ganho é um ciclo de feedback rápido, sem custo e sem risco de tocar uma conta real. A contrapartida é lembrar que o emulador **não substitui testes de segurança e de IAM** na AWS antes de ir para produção.
 
--   [x] Inicialização local do AWS Emulator em Docker.
--   [x] Configuração do endpoint HTTPS local.
--   [x] Tópico SNS.
--   [x] Fila SQS.
--   [x] Subscription SNS → SQS.
--   [x] Publicação de evento JSON com Go.
--   [x] Entrega automática da notificação SNS ao SQS.
--   [x] Recebimento com Long Polling.
--   [x] Desserialização do SNS Notification Envelope.
--   [x] Extração do evento original.
--   [x] Exclusão com `DeleteMessage` após processamento bem-sucedido.
--   [x] Testes manuais com AWS CLI.
+---
 
-### O que não faz parte desta implementação
+## 18. Referências
 
--   Banco de dados ou persistência de pagamentos.
--   Idempotência.
--   Dead Letter Queue (DLQ).
--   Estratégia de retry customizada.
--   Regras de negócio reais de pagamentos.
--   Observabilidade distribuída ou monitoramento avançado.
--   Infraestrutura de produção.
+- [Test your applications against AWS locally with AWS Emulator — AWS News Blog](https://aws.amazon.com/blogs/aws/test-your-applications-against-aws-locally-with-aws-emulator/)
+- [aws/aws-emulator — GitHub](https://github.com/aws/aws-emulator)
+- [Publicação de Daniel Abib no LinkedIn](https://lnkd.in/p/di6ZdG7U)
+- [Amazon SNS — documentação](https://docs.aws.amazon.com/sns/)
+- [Amazon SQS — documentação](https://docs.aws.amazon.com/sqs/)
+- [AWS SDK for Go v2](https://aws.github.io/aws-sdk-go-v2/)
 
-## 11. Conclusão
+---
 
-A POC demonstra, localmente, o padrão de mensageria
-**publish/subscribe** com SNS e processamento assíncrono com SQS.
+**Projeto:** `aws-emulator-poc-sqs-sns` · **Região:** `us-east-1` · **Endpoint local:** `https://127.0.0.1:9297`
 
-O Publisher não precisa conhecer o Consumer nem publicar diretamente na
-fila. Ele publica no tópico SNS, e a subscription faz a integração com o
-SQS. O Consumer fica responsável por buscar as mensagens, interpretar o
-envelope, processar o evento e confirmar o consumo por meio de
-`DeleteMessage`.
-
-A execução local com AWS Emulator permite experimentar esse fluxo usando
-Docker, AWS CLI e AWS SDK for Go v2, sem precisar apontar a aplicação
-para recursos de uma conta AWS real.
-
-------------------------------------------------------------------------
-
-## Referências úteis
-
--   [AWS Emulator --- documentação
-    oficial](https://docs.aws.amazon.com/)
-
--   [Amazon SNS --- documentação](https://docs.aws.amazon.com/sns/)
-
--   [Amazon SQS --- documentação](https://docs.aws.amazon.com/sqs/)
-
--   [AWS SDK for Go v2](https://aws.github.io/aws-sdk-go-v2/)
-
-------------------------------------------------------------------------
-
-**Projeto:** `aws-emulator-poc-sqs-sns`\
-**Região configurada:** `us-east-1`\
-**Endpoint local:** `https://127.0.0.1:9297`
+**Créditos pela inspiração:** [Daniel Abib](https://lnkd.in/p/di6ZdG7U)
