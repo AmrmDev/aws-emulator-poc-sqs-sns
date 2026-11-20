@@ -34,7 +34,9 @@ func main() {
 	)
 	defer stop()
 
-	log.Println("SQS Consumer started...")
+	log.Println("SQS CONSUMER STARTED")
+	log.Println("")
+
 
 	if err := consumer.Consume(ctx); err != nil {
 		log.Fatal(err)

@@ -42,7 +42,7 @@ func (c *Consumer) Consume(ctx context.Context) error {
 			WaitTimeSeconds:     10,
 		})
 		if err != nil {
-			return fmt.Errorf("receive SQS messages: %w", err)
+			return fmt.Errorf("Receive SQS messages: %w", err)
 		}
 
 		for _, message := range result.Messages {
@@ -59,8 +59,6 @@ func (c *Consumer) Consume(ctx context.Context) error {
 				fmt.Printf("Delete message failed: %v\n", err)
 				continue
 			}
-
-			fmt.Printf("Message deleted: %s\n", aws.ToString(message.MessageId))
 		}
 	}
 }
@@ -71,8 +69,6 @@ func (c *Consumer) process(ctx context.Context, message types.Message) error {
 	}
 
 	body := *message.Body
-
-	fmt.Printf("Raw SQS message: %s\n", body)
 
 	var envelope SNSEnvelope
 
@@ -91,6 +87,7 @@ func (c *Consumer) process(ctx context.Context, message types.Message) error {
 	}
 
 	fmt.Printf("Processing event: %+v\n", event)
+	fmt.Println("===========================")
 
 	return nil
 }
