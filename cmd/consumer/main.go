@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"errors"
 
 	"aws-emulator-poc-sqs-sns/config"
 	"aws-emulator-poc-sqs-sns/internal/messaging"
@@ -39,6 +40,10 @@ func main() {
 
 
 	if err := consumer.Consume(ctx); err != nil {
-		log.Fatal(err)
-	}
+		if !errors.Is(err, context.Canceled) {
+			log.Fatalf("Consumer failed: %v", err)
+		}
+	}	
+
+	log.Println("SQS CONSUMER STOPPED")
 }
